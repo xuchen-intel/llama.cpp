@@ -14,6 +14,8 @@
 #include <cassert>
 #include <cstdlib> // for qsort
 #include <cstdio>  // for GGML_ASSERT
+#include <vector>
+#include <algorithm> // for std::fill
 
 #define GGML_CPU_CLANG_WORKAROUND
 #include "../../repack.h"
@@ -6533,6 +6535,13 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 // generic ggml_gemm_q2_0c_8x8_q8_K_generic in repack.cpp):
 //   qs:    interleaved_index(row m, position p in [0,256)) = (p/8)*32 + m*8 + (p%8)
 //   bsums: interleaved_index(row m, group g in [0,16))      = (g/4)*16 + m*4 + (g%4)
+// GEMM: unlike a naive "4 rows per call" batching, llama.cpp's repack dispatcher
+// (tensor_traits::forward_mul_mat_one_chunk) chunks threads by WEIGHT COLUMNS, not by activation
+// rows -- each gemm() call typically receives ALL of nr (e.g. the full prefill batch, ~128 for
+// pp128), not just 4. So the weight unpack (q2_0c_unpack_col_half, the expensive part) is hoisted
+// OUTSIDE the row-group loop here and computed once per (column-block x, q2_0c-block l, half h,
+// column j), then reused across every row-group in the call -- not just once per 4 rows as a naive
+// per-group loop nest would do. This is the actual amortization Q4_K_M's own GEMM relies on.
 void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int nb = n / QKQ2_0C;
     const int ncols_interleaved = 8;
@@ -6544,38 +6553,39 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     UNUSED(bs);
 
 #if defined(__AVX2__)
+    const int n_groups = nr / 4;
     const __m256i ones16 = _mm256_set1_epi16(1);
 
-    for (int y = 0; y < nr / 4; y++) {
-        const block_q8_Kx4 * a_ptr = (const block_q8_Kx4 *) vy + (y * nb * 2);
+    std::vector<float> sumf(nr * ncols_interleaved);
+    std::vector<int32_t> ysum_all(nr);
 
-        for (int x = 0; x < nc / ncols_interleaved; x++) {
-            const block_q2_0cx8 * b_ptr = (const block_q2_0cx8 *) vx + (x * nb);
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_q2_0cx8 * b_ptr = (const block_q2_0cx8 *) vx + (x * nb);
 
-            float sumf[4][8];
-            for (int m = 0; m < 4; m++) {
-                for (int j = 0; j < ncols_interleaved; j++) {
-                    sumf[m][j] = 0.0f;
-                }
-            }
+        std::fill(sumf.begin(), sumf.end(), 0.0f);
 
-            for (int l = 0; l < nb; l++) {
-                for (int h = 0; h < 2; h++) {
-                    const block_q8_Kx4 * ya = a_ptr + l * 2 + h;
-
-                    int32_t ysum[4];
+        for (int l = 0; l < nb; l++) {
+            for (int h = 0; h < 2; h++) {
+                for (int g = 0; g < n_groups; g++) {
+                    const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb * 2 + l * 2 + h;
                     for (int m = 0; m < 4; m++) {
                         int32_t s_ = 0;
-                        for (int g = 0; g < 16; g++) {
-                            const int idx = (g / 4) * 16 + m * 4 + (g % 4);
+                        for (int gg = 0; gg < 16; gg++) {
+                            const int idx = (gg / 4) * 16 + m * 4 + (gg % 4);
                             s_ += ya->bsums[idx];
                         }
-                        ysum[m] = s_;
+                        ysum_all[g * 4 + m] = s_;
                     }
+                }
 
-                    for (int j = 0; j < ncols_interleaved; j++) {
-                        __m256i code[8];
-                        q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code);
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    __m256i code[8];
+                    q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code);
+
+                    const float d_j = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+
+                    for (int g = 0; g < n_groups; g++) {
+                        const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb * 2 + l * 2 + h;
 
                         __m256i acc16[4] = {
                             _mm256_setzero_si256(), _mm256_setzero_si256(),
@@ -6584,10 +6594,10 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
                         for (int pu = 0; pu < 2; pu++) {
                             const int base = pu * 128;
-                            for (int g = 0; g < 4; g++) {
-                                const int p_lo = base + 16 * g;
-                                const int p_hi = base + 64 + 16 * g;
-                                const __m256i cur_code = code[pu * 4 + g];
+                            for (int gr = 0; gr < 4; gr++) {
+                                const int p_lo = base + 16 * gr;
+                                const int p_hi = base + 64 + 16 * gr;
+                                const __m256i cur_code = code[pu * 4 + gr];
 
                                 for (int m = 0; m < 4; m++) {
                                     const __m128i y_lo = _mm_unpacklo_epi64(
@@ -6604,17 +6614,17 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
                         for (int m = 0; m < 4; m++) {
                             const int32_t sum_code_y = hsum_i32_8_q2_0c(_mm256_madd_epi16(acc16[m], ones16));
-                            const int32_t real_sum = 2 * sum_code_y - 3 * ysum[m];
-                            sumf[m][j] += (float) real_sum * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * ya->d[m];
+                            const int32_t real_sum = 2 * sum_code_y - 3 * ysum_all[g * 4 + m];
+                            sumf[(g * 4 + m) * ncols_interleaved + j] += (float) real_sum * d_j * ya->d[m];
                         }
                     }
                 }
             }
+        }
 
-            for (int m = 0; m < 4; m++) {
-                for (int j = 0; j < ncols_interleaved; j++) {
-                    s[(y * 4 + m) * bs + x * ncols_interleaved + j] = sumf[m][j];
-                }
+        for (int row = 0; row < nr; row++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+                s[row * bs + x * ncols_interleaved + j] = sumf[row * ncols_interleaved + j];
             }
         }
     }
