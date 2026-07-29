@@ -6554,7 +6554,9 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined(__AVX2__)
     const int n_groups = nr / 4;
+#if !defined(__AVXVNNI__)
     const __m256i ones16 = _mm256_set1_epi16(1);
+#endif
 
     std::vector<float> sumf(nr * ncols_interleaved);
     std::vector<int32_t> ysum_all(nr);
@@ -6592,6 +6594,49 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                 for (int g = 0; g < n_groups; g++) {
                     const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb * 2 + l * 2 + h;
 
+#if defined(__AVXVNNI__)
+                    // VPDPBUSD (AVX-VNNI) fuses multiply + widen + accumulate into int32 directly,
+                    // replacing the maddubs(int16)+add pair below with one instruction and removing
+                    // the separate int16->int32 widen step entirely (no more madd_epi16(...,ones16)).
+                    __m256i acc32[4][8];
+                    for (int m = 0; m < 4; m++) {
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            acc32[m][j] = _mm256_setzero_si256();
+                        }
+                    }
+
+                    for (int pu = 0; pu < 2; pu++) {
+                        const int base = pu * 128;
+                        for (int gr = 0; gr < 4; gr++) {
+                            const int p_lo = base + 16 * gr;
+                            const int p_hi = base + 64 + 16 * gr;
+                            const int round = pu * 4 + gr;
+
+                            for (int m = 0; m < 4; m++) {
+                                const __m128i y_lo = _mm_unpacklo_epi64(
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_lo / 8) * 32 + m * 8)),
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_lo / 8 + 1) * 32 + m * 8)));
+                                const __m128i y_hi = _mm_unpacklo_epi64(
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_hi / 8) * 32 + m * 8)),
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_hi / 8 + 1) * 32 + m * 8)));
+                                const __m256i yv = _mm256_insertf128_si256(_mm256_castsi128_si256(y_lo), y_hi, 1);
+
+                                for (int j = 0; j < ncols_interleaved; j++) {
+                                    acc32[m][j] = _mm256_dpbusd_avx_epi32(acc32[m][j], code_all[j][round], yv);
+                                }
+                            }
+                        }
+                    }
+
+                    for (int m = 0; m < 4; m++) {
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            const int32_t sum_code_y = hsum_i32_8_q2_0c(acc32[m][j]);
+                            const int32_t real_sum = 2 * sum_code_y - 3 * ysum_all[g * 4 + m];
+                            const float d_j = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+                            sumf[(g * 4 + m) * ncols_interleaved + j] += (float) real_sum * d_j * ya->d[m];
+                        }
+                    }
+#else
                     __m256i acc16[4][8];
                     for (int m = 0; m < 4; m++) {
                         for (int j = 0; j < ncols_interleaved; j++) {
@@ -6631,6 +6676,7 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                             sumf[(g * 4 + m) * ncols_interleaved + j] += (float) real_sum * d_j * ya->d[m];
                         }
                     }
+#endif
                 }
             }
         }
