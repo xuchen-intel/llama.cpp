@@ -1571,6 +1571,111 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+void ggml_vec_dot_q2_0c_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0c * GGML_RESTRICT x = vx;
+    const block_q8_K  * GGML_RESTRICT y = vy;
+
+    GGML_ASSERT(n % QKQ2_0C == 0);
+    const int nb = n / QKQ2_0C;
+
+#if defined(__AVX2__)
+    // Q2_0C packs 4 consecutive weights per byte (bits[1:0]=w+0 .. bits[7:6]=w+3), value =
+    // 2*code-3 for code in {0,1,2,3}. Each q2_0c block spans 2 q8_K halves of 256 weights.
+    //
+    // For byte-group g (4 source bytes local to a 128-bit lane), replicate each byte 4x so it
+    // lines up with all 4 of its own weights' output positions, then select the correct 2-bit
+    // field per output position via 3 blendv passes keyed on the fixed (position % 4) pattern.
+    // This reconstructs a natural-order 32-byte code vector matching a contiguous q8_K span.
+    const int bytes_per_half = QK_K / 4; // 64 packed bytes = 256 weights
+
+    const __m256i rep_mask[4] = {
+        _mm256_setr_epi8( 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+                          0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3),
+        _mm256_setr_epi8( 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+                          4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7),
+        _mm256_setr_epi8( 8, 8, 8, 8, 9, 9, 9, 9,10,10,10,10,11,11,11,11,
+                          8, 8, 8, 8, 9, 9, 9, 9,10,10,10,10,11,11,11,11),
+        _mm256_setr_epi8(12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15,
+                         12,12,12,12,13,13,13,13,14,14,14,14,15,15,15,15),
+    };
+    const __m256i sel1 = _mm256_setr_epi8(0,-128,0,0, 0,-128,0,0, 0,-128,0,0, 0,-128,0,0,
+                                           0,-128,0,0, 0,-128,0,0, 0,-128,0,0, 0,-128,0,0);
+    const __m256i sel2 = _mm256_setr_epi8(0,0,-128,0, 0,0,-128,0, 0,0,-128,0, 0,0,-128,0,
+                                           0,0,-128,0, 0,0,-128,0, 0,0,-128,0, 0,0,-128,0);
+    const __m256i sel3 = _mm256_setr_epi8(0,0,0,-128, 0,0,0,-128, 0,0,0,-128, 0,0,0,-128,
+                                           0,0,0,-128, 0,0,0,-128, 0,0,0,-128, 0,0,0,-128);
+    const __m256i mask3 = _mm256_set1_epi8(3);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const block_q2_0c * xb = x + i;
+        const block_q8_K  * yh[2] = { y + i*2 + 0, y + i*2 + 1 };
+
+        float dot_half[2];
+
+        for (int h = 0; h < 2; ++h) {
+            const uint8_t * qs_half = xb->qs + h * bytes_per_half;
+            const int8_t  * yqs = yh[h]->qs;
+
+            __m256i acc16 = _mm256_setzero_si256();
+
+            for (int pu = 0; pu < 2; ++pu) {
+                const __m256i P = _mm256_loadu_si256((const __m256i *) (qs_half + pu * 32));
+                const int base = pu * 128;
+
+                for (int g = 0; g < 4; ++g) {
+                    const __m256i rep = _mm256_shuffle_epi8(P, rep_mask[g]);
+                    const __m256i v0 = _mm256_and_si256(rep, mask3);
+                    const __m256i v1 = _mm256_and_si256(_mm256_srli_epi16(rep, 2), mask3);
+                    const __m256i v2 = _mm256_and_si256(_mm256_srli_epi16(rep, 4), mask3);
+                    const __m256i v3 = _mm256_and_si256(_mm256_srli_epi16(rep, 6), mask3);
+
+                    __m256i code = _mm256_blendv_epi8(v0, v1, sel1);
+                    code = _mm256_blendv_epi8(code, v2, sel2);
+                    code = _mm256_blendv_epi8(code, v3, sel3);
+
+                    const __m128i y_lo = _mm_loadu_si128((const __m128i *) (yqs + base + 16*g));
+                    const __m128i y_hi = _mm_loadu_si128((const __m128i *) (yqs + base + 64 + 16*g));
+                    const __m256i yv = MM256_SET_M128I(y_hi, y_lo);
+
+                    const __m256i prod = _mm256_maddubs_epi16(code, yv);
+                    acc16 = _mm256_add_epi16(acc16, prod);
+                }
+            }
+
+            const __m256i acc32 = _mm256_madd_epi16(acc16, ones16);
+            const int32_t sum_code_y = hsum_i32_8(acc32);
+
+            const __m256i bsums_raw = _mm256_loadu_si256((const __m256i *) yh[h]->bsums);
+            const __m256i bsums32 = _mm256_madd_epi16(bsums_raw, ones16);
+            const int32_t ysum = hsum_i32_8(bsums32);
+
+            // value = 2*code - 3  =>  dot(value,y) = 2*sum(code*y) - 3*sum(y)
+            const int32_t real_sum = 2*sum_code_y - 3*ysum;
+            dot_half[h] = (float) real_sum * yh[h]->d;
+        }
+
+        const float d = GGML_CPU_FP16_TO_FP32(xb->d);
+        sumf += d * (dot_half[0] + dot_half[1]);
+    }
+
+    *s = sumf;
+#else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
+    ggml_vec_dot_q2_0c_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
