@@ -6578,43 +6578,56 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                     }
                 }
 
+                // Unpack all 8 columns' weight codes ONCE per (l,h) -- shared below across every
+                // row-group. Indexed [col][round] (round = pu*4+gr, 8 total per half).
+                __m256i code_all[ncols_interleaved][8];
                 for (int j = 0; j < ncols_interleaved; j++) {
-                    __m256i code[8];
-                    q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code);
+                    q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code_all[j]);
+                }
 
-                    const float d_j = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+                // The activation gather below (y_lo/y_hi/yv) depends only on (row-group g, round,
+                // sub-row m) -- NOT on column j -- so it must be computed once per (g, round, m) and
+                // reused across all 8 columns, not recomputed per column (that was the previous
+                // bottleneck: an 8x redundant gather).
+                for (int g = 0; g < n_groups; g++) {
+                    const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb * 2 + l * 2 + h;
 
-                    for (int g = 0; g < n_groups; g++) {
-                        const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb * 2 + l * 2 + h;
+                    __m256i acc16[4][8];
+                    for (int m = 0; m < 4; m++) {
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            acc16[m][j] = _mm256_setzero_si256();
+                        }
+                    }
 
-                        __m256i acc16[4] = {
-                            _mm256_setzero_si256(), _mm256_setzero_si256(),
-                            _mm256_setzero_si256(), _mm256_setzero_si256(),
-                        };
+                    for (int pu = 0; pu < 2; pu++) {
+                        const int base = pu * 128;
+                        for (int gr = 0; gr < 4; gr++) {
+                            const int p_lo = base + 16 * gr;
+                            const int p_hi = base + 64 + 16 * gr;
+                            const int round = pu * 4 + gr;
 
-                        for (int pu = 0; pu < 2; pu++) {
-                            const int base = pu * 128;
-                            for (int gr = 0; gr < 4; gr++) {
-                                const int p_lo = base + 16 * gr;
-                                const int p_hi = base + 64 + 16 * gr;
-                                const __m256i cur_code = code[pu * 4 + gr];
+                            for (int m = 0; m < 4; m++) {
+                                const __m128i y_lo = _mm_unpacklo_epi64(
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_lo / 8) * 32 + m * 8)),
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_lo / 8 + 1) * 32 + m * 8)));
+                                const __m128i y_hi = _mm_unpacklo_epi64(
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_hi / 8) * 32 + m * 8)),
+                                    _mm_loadl_epi64((const __m128i *) (ya->qs + (p_hi / 8 + 1) * 32 + m * 8)));
+                                const __m256i yv = _mm256_insertf128_si256(_mm256_castsi128_si256(y_lo), y_hi, 1);
 
-                                for (int m = 0; m < 4; m++) {
-                                    const __m128i y_lo = _mm_unpacklo_epi64(
-                                        _mm_loadl_epi64((const __m128i *) (ya->qs + (p_lo / 8) * 32 + m * 8)),
-                                        _mm_loadl_epi64((const __m128i *) (ya->qs + (p_lo / 8 + 1) * 32 + m * 8)));
-                                    const __m128i y_hi = _mm_unpacklo_epi64(
-                                        _mm_loadl_epi64((const __m128i *) (ya->qs + (p_hi / 8) * 32 + m * 8)),
-                                        _mm_loadl_epi64((const __m128i *) (ya->qs + (p_hi / 8 + 1) * 32 + m * 8)));
-                                    const __m256i yv = _mm256_insertf128_si256(_mm256_castsi128_si256(y_lo), y_hi, 1);
-                                    acc16[m] = _mm256_add_epi16(acc16[m], _mm256_maddubs_epi16(cur_code, yv));
+                                for (int j = 0; j < ncols_interleaved; j++) {
+                                    acc16[m][j] = _mm256_add_epi16(acc16[m][j],
+                                        _mm256_maddubs_epi16(code_all[j][round], yv));
                                 }
                             }
                         }
+                    }
 
-                        for (int m = 0; m < 4; m++) {
-                            const int32_t sum_code_y = hsum_i32_8_q2_0c(_mm256_madd_epi16(acc16[m], ones16));
+                    for (int m = 0; m < 4; m++) {
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            const int32_t sum_code_y = hsum_i32_8_q2_0c(_mm256_madd_epi16(acc16[m][j], ones16));
                             const int32_t real_sum = 2 * sum_code_y - 3 * ysum_all[g * 4 + m];
+                            const float d_j = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
                             sumf[(g * 4 + m) * ncols_interleaved + j] += (float) real_sum * d_j * ya->d[m];
                         }
                     }
