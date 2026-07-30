@@ -427,10 +427,10 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_4_8 = 37,
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-        GGML_TYPE_STQ1_0  = 40, // customer model files quantize STQ1_0 tensors as type 40
+        GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q2_0C   = 41, // customer model files quantize Q2_0C tensors as type 41
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_NVFP4   = 43, // NVFP4 (4 blocks, E4M3 scale)
+        GGML_TYPE_STQ1_0  = 43, // customer's NEW model files quantize STQ1_0 tensors as type 43
         GGML_TYPE_Q1_0    = 44,
         GGML_TYPE_COUNT   = 45,
     };

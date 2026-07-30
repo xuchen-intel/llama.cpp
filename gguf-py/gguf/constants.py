@@ -4707,10 +4707,10 @@ class GGMLQuantizationType(IntEnum):
     TQ1_0   = 34
     TQ2_0   = 35
     MXFP4   = 39
-    STQ1_0  = 40
+    NVFP4   = 40
     Q2_0C   = 41
     Q2_0    = 42
-    NVFP4   = 43
+    STQ1_0  = 43
     Q1_0    = 44
 
 
@@ -4765,10 +4765,10 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ1_0         = 36  # except 1d tensors
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
-    MOSTLY_STQ1_0        = 39  # except 1d tensors
+    MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q2_0C         = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
-    MOSTLY_NVFP4         = 42  # except 1d tensors
+    MOSTLY_STQ1_0        = 42  # except 1d tensors
     MOSTLY_Q1_0          = 43  # except 1d tensors
 
     GUESSED              = 1024  # not specified in the model file
