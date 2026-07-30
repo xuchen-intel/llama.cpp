@@ -6482,7 +6482,9 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined(__AVX2__)
     const block_q8_K * a_ptr_start = (const block_q8_K *) vy;
+#if !defined(__AVXVNNI__)
     const __m256i ones16 = _mm256_set1_epi16(1);
+#endif
 
     for (int x = 0; x < nc / ncols_interleaved; x++) {
         const block_q2_0cx8 * b_ptr = (const block_q2_0cx8 *) vx + (x * nb);
@@ -6494,24 +6496,46 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                 const block_q8_K * y = a_ptr_start + l * 2 + h;
 
                 const __m256i bsums_raw = _mm256_loadu_si256((const __m256i *) y->bsums);
+#if defined(__AVXVNNI__)
+                const __m256i ones16 = _mm256_set1_epi16(1);
+#endif
                 const int32_t ysum = hsum_i32_8_q2_0c(_mm256_madd_epi16(bsums_raw, ones16));
 
+                // Hoist weight unpacking: compute all 8 columns' codes once per (l,h)
+                __m256i code_all[ncols_interleaved][8];
                 for (int j = 0; j < ncols_interleaved; j++) {
-                    __m256i code[8];
-                    q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code);
+                    q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code_all[j]);
+                }
 
-                    __m256i acc16 = _mm256_setzero_si256();
+                // Hoist activation loading: load once per (pu, g), reuse across all 8 columns
+                __m256i yv_all[2][4];
+                for (int pu = 0; pu < 2; pu++) {
+                    const int base = pu * 128;
+                    for (int g = 0; g < 4; g++) {
+                        const __m128i y_lo = _mm_loadu_si128((const __m128i *) (y->qs + base + 16 * g));
+                        const __m128i y_hi = _mm_loadu_si128((const __m128i *) (y->qs + base + 64 + 16 * g));
+                        yv_all[pu][g] = _mm256_insertf128_si256(_mm256_castsi128_si256(y_lo), y_hi, 1);
+                    }
+                }
+
+                for (int j = 0; j < ncols_interleaved; j++) {
+#if defined(__AVXVNNI__)
+                    __m256i acc32 = _mm256_setzero_si256();
                     for (int pu = 0; pu < 2; pu++) {
-                        const int base = pu * 128;
                         for (int g = 0; g < 4; g++) {
-                            const __m128i y_lo = _mm_loadu_si128((const __m128i *) (y->qs + base + 16 * g));
-                            const __m128i y_hi = _mm_loadu_si128((const __m128i *) (y->qs + base + 64 + 16 * g));
-                            const __m256i yv = _mm256_insertf128_si256(_mm256_castsi128_si256(y_lo), y_hi, 1);
-                            acc16 = _mm256_add_epi16(acc16, _mm256_maddubs_epi16(code[pu * 4 + g], yv));
+                            acc32 = _mm256_dpbusd_avx_epi32(acc32, code_all[j][pu * 4 + g], yv_all[pu][g]);
                         }
                     }
-
+                    const int32_t sum_code_y = hsum_i32_8_q2_0c(acc32);
+#else
+                    __m256i acc16 = _mm256_setzero_si256();
+                    for (int pu = 0; pu < 2; pu++) {
+                        for (int g = 0; g < 4; g++) {
+                            acc16 = _mm256_add_epi16(acc16, _mm256_maddubs_epi16(code_all[j][pu * 4 + g], yv_all[pu][g]));
+                        }
+                    }
                     const int32_t sum_code_y = hsum_i32_8_q2_0c(_mm256_madd_epi16(acc16, ones16));
+#endif
                     const int32_t real_sum = 2 * sum_code_y - 3 * ysum;
                     sumf[j] += (float) real_sum * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * y->d;
                 }
