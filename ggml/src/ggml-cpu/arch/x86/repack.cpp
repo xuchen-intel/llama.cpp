@@ -6481,70 +6481,87 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     UNUSED(nr);
 
 #if defined(__AVX2__)
+    // Q4_K_M-style lane-parallel GEMV: all 8 interleaved weight columns stay resident in the 8
+    // SIMD lanes (column X permanently in lane X) for the whole (l,h) accumulation, so the packed
+    // bytes are consumed DIRECTLY from the interleaved block_q2_0cx8 layout -- no per-column memcpy
+    // deinterleave (the old q2_0c_unpack_col_half gather that made decode GEMV-bound). Within a half,
+    // the 512 bytes are 8 contiguous 64-byte chunks; chunk k holds all 8 columns' 32-weight span
+    // [k*32 : k*32+32] in column order (col j at byte k*64 + j*8), and the matching activation span
+    // y->qs[k*32 : +32] is contiguous too.
     const block_q8_K * a_ptr_start = (const block_q8_K *) vy;
-#if !defined(__AVXVNNI__)
     const __m256i ones16 = _mm256_set1_epi16(1);
-#endif
+    const __m256i mask3  = _mm256_set1_epi8(0x03);
+
+    // Gather even/odd 32-bit lanes: even -> each column's low 4 bytes (weights 0..15 of the chunk),
+    // odd -> high 4 bytes (weights 16..31). raw_lo lanes are [c0.B0-3, c0.B4-7, c1.B0-3, c1.B4-7, ...].
+    const __m256i even_idx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    const __m256i odd_idx  = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+
+    // Build strided activation groups [y_m, y_{4+m}, y_{8+m}, y_{12+m}] replicated across every
+    // 32-bit lane (shuffle_epi8 is per-128-lane; source is broadcast to both lanes first). This
+    // matches the strided weights produced by extracting 2-bit field m from 4 consecutive bytes.
+    const __m256i ymask[4] = {
+        _mm256_setr_epi8( 0,4, 8,12,  0,4, 8,12,  0,4, 8,12,  0,4, 8,12,
+                          0,4, 8,12,  0,4, 8,12,  0,4, 8,12,  0,4, 8,12),
+        _mm256_setr_epi8( 1,5, 9,13,  1,5, 9,13,  1,5, 9,13,  1,5, 9,13,
+                          1,5, 9,13,  1,5, 9,13,  1,5, 9,13,  1,5, 9,13),
+        _mm256_setr_epi8( 2,6,10,14,  2,6,10,14,  2,6,10,14,  2,6,10,14,
+                          2,6,10,14,  2,6,10,14,  2,6,10,14,  2,6,10,14),
+        _mm256_setr_epi8( 3,7,11,15,  3,7,11,15,  3,7,11,15,  3,7,11,15,
+                          3,7,11,15,  3,7,11,15,  3,7,11,15,  3,7,11,15),
+    };
 
     for (int x = 0; x < nc / ncols_interleaved; x++) {
         const block_q2_0cx8 * b_ptr = (const block_q2_0cx8 *) vx + (x * nb);
 
-        float sumf[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        __m256 sumf = _mm256_setzero_ps();  // lane X = accumulated result for column X
 
         for (int l = 0; l < nb; l++) {
+            // column deltas d[0..7] fp16 -> fp32 (lane X = column X, matching the acc lanes)
+            const __m256 dcol = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b_ptr[l].d));
+
             for (int h = 0; h < 2; h++) {
                 const block_q8_K * y = a_ptr_start + l * 2 + h;
 
                 const __m256i bsums_raw = _mm256_loadu_si256((const __m256i *) y->bsums);
-#if defined(__AVXVNNI__)
-                const __m256i ones16 = _mm256_set1_epi16(1);
-#endif
                 const int32_t ysum = hsum_i32_8_q2_0c(_mm256_madd_epi16(bsums_raw, ones16));
 
-                // Hoist weight unpacking: compute all 8 columns' codes once per (l,h)
-                __m256i code_all[ncols_interleaved][8];
-                for (int j = 0; j < ncols_interleaved; j++) {
-                    q2_0c_unpack_col_half(b_ptr[l].qs + h * 512 + j * 8, code_all[j]);
+                const uint8_t * qs_half = b_ptr[l].qs + h * 512;
+
+                __m256i acc = _mm256_setzero_si256();  // int32 x8, lane X = sum(code*y) for column X
+
+                for (int k = 0; k < 8; k++) {
+                    const __m256i raw_lo = _mm256_loadu_si256((const __m256i *) (qs_half + k * 64));
+                    const __m256i raw_hi = _mm256_loadu_si256((const __m256i *) (qs_half + k * 64 + 32));
+
+                    // LO: lane X = column X's bytes[0..3] (weights k*32 + 0..15, still packed)
+                    // HI: lane X = column X's bytes[4..7] (weights k*32 + 16..31, still packed)
+                    const __m256i LO = _mm256_permute2x128_si256(
+                        _mm256_permutevar8x32_epi32(raw_lo, even_idx),
+                        _mm256_permutevar8x32_epi32(raw_hi, even_idx), 0x20);
+                    const __m256i HI = _mm256_permute2x128_si256(
+                        _mm256_permutevar8x32_epi32(raw_lo, odd_idx),
+                        _mm256_permutevar8x32_epi32(raw_hi, odd_idx), 0x20);
+
+                    const __m256i ya = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (y->qs + k * 32)));
+                    const __m256i yb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (y->qs + k * 32 + 16)));
+
+                    for (int m = 0; m < 4; m++) {
+                        const __m256i cLO = _mm256_and_si256(_mm256_srli_epi16(LO, 2 * m), mask3);
+                        const __m256i cHI = _mm256_and_si256(_mm256_srli_epi16(HI, 2 * m), mask3);
+                        acc = mul_sum_us8_pairs_acc_int32x8(acc, cLO, _mm256_shuffle_epi8(ya, ymask[m]));
+                        acc = mul_sum_us8_pairs_acc_int32x8(acc, cHI, _mm256_shuffle_epi8(yb, ymask[m]));
+                    }
                 }
 
-                // Hoist activation loading: load once per (pu, g), reuse across all 8 columns
-                __m256i yv_all[2][4];
-                for (int pu = 0; pu < 2; pu++) {
-                    const int base = pu * 128;
-                    for (int g = 0; g < 4; g++) {
-                        const __m128i y_lo = _mm_loadu_si128((const __m128i *) (y->qs + base + 16 * g));
-                        const __m128i y_hi = _mm_loadu_si128((const __m128i *) (y->qs + base + 64 + 16 * g));
-                        yv_all[pu][g] = _mm256_insertf128_si256(_mm256_castsi128_si256(y_lo), y_hi, 1);
-                    }
-                }
-
-                for (int j = 0; j < ncols_interleaved; j++) {
-#if defined(__AVXVNNI__)
-                    __m256i acc32 = _mm256_setzero_si256();
-                    for (int pu = 0; pu < 2; pu++) {
-                        for (int g = 0; g < 4; g++) {
-                            acc32 = _mm256_dpbusd_avx_epi32(acc32, code_all[j][pu * 4 + g], yv_all[pu][g]);
-                        }
-                    }
-                    const int32_t sum_code_y = hsum_i32_8_q2_0c(acc32);
-#else
-                    __m256i acc16 = _mm256_setzero_si256();
-                    for (int pu = 0; pu < 2; pu++) {
-                        for (int g = 0; g < 4; g++) {
-                            acc16 = _mm256_add_epi16(acc16, _mm256_maddubs_epi16(code_all[j][pu * 4 + g], yv_all[pu][g]));
-                        }
-                    }
-                    const int32_t sum_code_y = hsum_i32_8_q2_0c(_mm256_madd_epi16(acc16, ones16));
-#endif
-                    const int32_t real_sum = 2 * sum_code_y - 3 * ysum;
-                    sumf[j] += (float) real_sum * GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]) * y->d;
-                }
+                // real = 2*sum(code*y) - 3*ysum  per column; sumf += real * d[col] * y->d
+                const __m256i real = _mm256_sub_epi32(_mm256_slli_epi32(acc, 1), _mm256_set1_epi32(3 * ysum));
+                const __m256  scale = _mm256_mul_ps(dcol, _mm256_set1_ps(y->d));
+                sumf = _mm256_fmadd_ps(_mm256_cvtepi32_ps(real), scale, sumf);
             }
         }
 
-        for (int j = 0; j < ncols_interleaved; j++) {
-            s[x * ncols_interleaved + j] = sumf[j];
-        }
+        _mm256_storeu_ps(s + x * ncols_interleaved, sumf);
     }
 #else
     ggml_gemv_q2_0c_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
@@ -6591,6 +6608,10 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         std::fill(sumf.begin(), sumf.end(), 0.0f);
 
         for (int l = 0; l < nb; l++) {
+            // column deltas d[0..7] fp16 -> fp32 via hardware F16C (no ggml_table_f32_f16 dependency)
+            float dcol_f[8];
+            _mm256_storeu_ps(dcol_f, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b_ptr[l].d)));
+
             for (int h = 0; h < 2; h++) {
                 for (int g = 0; g < n_groups; g++) {
                     const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb * 2 + l * 2 + h;
@@ -6656,7 +6677,7 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         for (int j = 0; j < ncols_interleaved; j++) {
                             const int32_t sum_code_y = hsum_i32_8_q2_0c(acc32[m][j]);
                             const int32_t real_sum = 2 * sum_code_y - 3 * ysum_all[g * 4 + m];
-                            const float d_j = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+                            const float d_j = dcol_f[j];
                             sumf[(g * 4 + m) * ncols_interleaved + j] += (float) real_sum * d_j * ya->d[m];
                         }
                     }
@@ -6696,7 +6717,7 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
                         for (int j = 0; j < ncols_interleaved; j++) {
                             const int32_t sum_code_y = hsum_i32_8_q2_0c(_mm256_madd_epi16(acc16[m][j], ones16));
                             const int32_t real_sum = 2 * sum_code_y - 3 * ysum_all[g * 4 + m];
-                            const float d_j = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+                            const float d_j = dcol_f[j];
                             sumf[(g * 4 + m) * ncols_interleaved + j] += (float) real_sum * d_j * ya->d[m];
                         }
                     }
