@@ -6481,25 +6481,27 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     UNUSED(nr);
 
 #if defined(__AVX2__)
-    // Q4_K_M-style lane-parallel GEMV: all 8 interleaved weight columns stay resident in the 8
-    // SIMD lanes (column X permanently in lane X) for the whole (l,h) accumulation, so the packed
-    // bytes are consumed DIRECTLY from the interleaved block_q2_0cx8 layout -- no per-column memcpy
-    // deinterleave (the old q2_0c_unpack_col_half gather that made decode GEMV-bound). Within a half,
-    // the 512 bytes are 8 contiguous 64-byte chunks; chunk k holds all 8 columns' 32-weight span
-    // [k*32 : k*32+32] in column order (col j at byte k*64 + j*8), and the matching activation span
-    // y->qs[k*32 : +32] is contiguous too.
+    // Q4_K_M-style lane-parallel GEMV: the 8 interleaved weight columns are consumed DIRECTLY from
+    // the interleaved block_q2_0cx8 layout -- no per-column memcpy deinterleave (the old
+    // q2_0c_unpack_col_half gather that made decode GEMV-bound). Within a half, the 512 bytes are 8
+    // contiguous 64-byte chunks; chunk k holds all 8 columns' 32-weight span [k*32 : k*32+32] in
+    // column order (col j at byte k*64 + j*8), and the matching activation y->qs[k*32 : +32] is
+    // contiguous too.
+    //
+    // Weights are kept in their NATURAL loaded lane order (raw_lo = cols0-3 as
+    // [c0.B0-3, c0.B4-7, c1.B0-3, c1.B4-7, ...], raw_hi = cols4-7) and dotted in place -- this avoids
+    // the 6 cross-lane permutes per chunk (permutevar8x32 x4 + permute2x128 x2, all port-5) that a
+    // "column X in lane X" layout would need. Each column's two byte-halves (weights 0-15 and 16-31)
+    // land in adjacent lanes and are summed by ONE hadd per block-half at the end. Decode is
+    // compute/shuffle-port bound here (it scales with cores past where Q4_K_M plateaus and reaches
+    // lower effective GB/s), so cutting the per-chunk port-5 traffic is the win.
     const block_q8_K * a_ptr_start = (const block_q8_K *) vy;
     const __m256i ones16 = _mm256_set1_epi16(1);
     const __m256i mask3  = _mm256_set1_epi8(0x03);
 
-    // Gather even/odd 32-bit lanes: even -> each column's low 4 bytes (weights 0..15 of the chunk),
-    // odd -> high 4 bytes (weights 16..31). raw_lo lanes are [c0.B0-3, c0.B4-7, c1.B0-3, c1.B4-7, ...].
-    const __m256i even_idx = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-    const __m256i odd_idx  = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
-
-    // Build strided activation groups [y_m, y_{4+m}, y_{8+m}, y_{12+m}] replicated across every
-    // 32-bit lane (shuffle_epi8 is per-128-lane; source is broadcast to both lanes first). This
-    // matches the strided weights produced by extracting 2-bit field m from 4 consecutive bytes.
+    // Build strided activation group [y_m, y_{4+m}, y_{8+m}, y_{12+m}] replicated across every 32-bit
+    // lane (shuffle_epi8 is per-128-lane; source broadcast to both lanes first). Matches the strided
+    // weights from extracting 2-bit field m of 4 consecutive bytes.
     const __m256i ymask[4] = {
         _mm256_setr_epi8( 0,4, 8,12,  0,4, 8,12,  0,4, 8,12,  0,4, 8,12,
                           0,4, 8,12,  0,4, 8,12,  0,4, 8,12,  0,4, 8,12),
@@ -6510,6 +6512,8 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         _mm256_setr_epi8( 3,7,11,15,  3,7,11,15,  3,7,11,15,  3,7,11,15,
                           3,7,11,15,  3,7,11,15,  3,7,11,15,  3,7,11,15),
     };
+    // After hadd(acc_lo, acc_hi) the columns land as [c0,c1,c4,c5,c2,c3,c6,c7]; this reorders to c0..c7.
+    const __m256i col_order = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
 
     for (int x = 0; x < nc / ncols_interleaved; x++) {
         const block_q2_0cx8 * b_ptr = (const block_q2_0cx8 *) vx + (x * nb);
@@ -6517,7 +6521,7 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
         __m256 sumf = _mm256_setzero_ps();  // lane X = accumulated result for column X
 
         for (int l = 0; l < nb; l++) {
-            // column deltas d[0..7] fp16 -> fp32 (lane X = column X, matching the acc lanes)
+            // column deltas d[0..7] fp16 -> fp32 (lane X = column X, matching the reduced-acc lanes)
             const __m256 dcol = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b_ptr[l].d));
 
             for (int h = 0; h < 2; h++) {
@@ -6528,31 +6532,33 @@ void ggml_gemv_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
                 const uint8_t * qs_half = b_ptr[l].qs + h * 512;
 
-                __m256i acc = _mm256_setzero_si256();  // int32 x8, lane X = sum(code*y) for column X
+                // acc_lo lanes: [c0.lo, c0.hi, c1.lo, c1.hi, c2.lo, c2.hi, c3.lo, c3.hi]
+                // acc_hi lanes: [c4.lo, c4.hi, ...,                        c7.lo, c7.hi]
+                // where X.lo = sum over weights 0..15, X.hi = sum over weights 16..31 (of the chunk).
+                __m256i acc_lo = _mm256_setzero_si256();
+                __m256i acc_hi = _mm256_setzero_si256();
 
                 for (int k = 0; k < 8; k++) {
-                    const __m256i raw_lo = _mm256_loadu_si256((const __m256i *) (qs_half + k * 64));
-                    const __m256i raw_hi = _mm256_loadu_si256((const __m256i *) (qs_half + k * 64 + 32));
-
-                    // LO: lane X = column X's bytes[0..3] (weights k*32 + 0..15, still packed)
-                    // HI: lane X = column X's bytes[4..7] (weights k*32 + 16..31, still packed)
-                    const __m256i LO = _mm256_permute2x128_si256(
-                        _mm256_permutevar8x32_epi32(raw_lo, even_idx),
-                        _mm256_permutevar8x32_epi32(raw_hi, even_idx), 0x20);
-                    const __m256i HI = _mm256_permute2x128_si256(
-                        _mm256_permutevar8x32_epi32(raw_lo, odd_idx),
-                        _mm256_permutevar8x32_epi32(raw_hi, odd_idx), 0x20);
+                    const __m256i raw_lo = _mm256_loadu_si256((const __m256i *) (qs_half + k * 64));       // cols 0-3
+                    const __m256i raw_hi = _mm256_loadu_si256((const __m256i *) (qs_half + k * 64 + 32));  // cols 4-7
 
                     const __m256i ya = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (y->qs + k * 32)));
                     const __m256i yb = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (y->qs + k * 32 + 16)));
 
                     for (int m = 0; m < 4; m++) {
-                        const __m256i cLO = _mm256_and_si256(_mm256_srli_epi16(LO, 2 * m), mask3);
-                        const __m256i cHI = _mm256_and_si256(_mm256_srli_epi16(HI, 2 * m), mask3);
-                        acc = mul_sum_us8_pairs_acc_int32x8(acc, cLO, _mm256_shuffle_epi8(ya, ymask[m]));
-                        acc = mul_sum_us8_pairs_acc_int32x8(acc, cHI, _mm256_shuffle_epi8(yb, ymask[m]));
+                        // yv: even lanes = low-strided activation (matches each col's B0-3 lane),
+                        //     odd  lanes = high-strided activation (matches each col's B4-7 lane).
+                        const __m256i yv = _mm256_blend_epi32(_mm256_shuffle_epi8(ya, ymask[m]),
+                                                              _mm256_shuffle_epi8(yb, ymask[m]), 0xAA);
+                        const __m256i cl = _mm256_and_si256(_mm256_srli_epi16(raw_lo, 2 * m), mask3);
+                        const __m256i ch = _mm256_and_si256(_mm256_srli_epi16(raw_hi, 2 * m), mask3);
+                        acc_lo = mul_sum_us8_pairs_acc_int32x8(acc_lo, cl, yv);
+                        acc_hi = mul_sum_us8_pairs_acc_int32x8(acc_hi, ch, yv);
                     }
                 }
+
+                // Sum each column's two byte-halves (adjacent lanes) and reorder to [c0..c7].
+                const __m256i acc = _mm256_permutevar8x32_epi32(_mm256_hadd_epi32(acc_lo, acc_hi), col_order);
 
                 // real = 2*sum(code*y) - 3*ysum  per column; sumf += real * d[col] * y->d
                 const __m256i real = _mm256_sub_epi32(_mm256_slli_epi32(acc, 1), _mm256_set1_epi32(3 * ysum));
