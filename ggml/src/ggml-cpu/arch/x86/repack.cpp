@@ -6798,11 +6798,11 @@ void ggml_gemv_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
             float dcol_f[8];
             _mm256_storeu_ps(dcol_f, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b_ptr[l].d)));
 
+            // Decode all 8 columns' 8 rounds (round r = h*4 + p) ONCE.
+            __m256i qcode[8][8];
             for (int j = 0; j < ncols_interleaved; j++) {
                 const uint8_t * qs  = b_ptr[l].qs;
                 const uint8_t * sgn = b_ptr[l].sign + j * 8;
-
-                __m256i acc = _mm256_setzero_si256();
                 for (int h = 0; h < 2; h++) {
                     const __m128i c0 = _mm_loadl_epi64((const __m128i *) (qs + (2*h    ) * 64 + j * 8));
                     const __m128i c1 = _mm_loadl_epi64((const __m128i *) (qs + (2*h + 1) * 64 + j * 8));
@@ -6810,16 +6810,35 @@ void ggml_gemv_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                     uint32_t s4;
                     memcpy(&s4, sgn + h * 4, 4);
                     const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, cb_hi, m4b, sign_spread, bit_sel);
-
-                    const int8_t * yqs = y->qs + h * 128;
                     for (int p = 0; p < 4; p++) {
-                        const __m256i q = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
-                        const __m128i ylo = _mm_loadu_si128((const __m128i *) (yqs + p * 16));
-                        const __m128i yhi = _mm_loadu_si128((const __m128i *) (yqs + 64 + p * 16));
-                        acc = mul_sum_us8_pairs_acc_int32x8(acc, q, _mm256_set_m128i(yhi, ylo));
+                        qcode[j][h * 4 + p] = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
                     }
                 }
-                const int32_t sum_qy = hsum_i32_8_q2_0c(acc);
+            }
+
+            // Load each round's activation ONCE (shared across all 8 columns, not reloaded per column).
+            __m256i yv[8];
+            for (int h = 0; h < 2; h++) {
+                const int8_t * yqs = y->qs + h * 128;
+                for (int p = 0; p < 4; p++) {
+                    const __m128i ylo = _mm_loadu_si128((const __m128i *) (yqs + p * 16));
+                    const __m128i yhi = _mm_loadu_si128((const __m128i *) (yqs + 64 + p * 16));
+                    yv[h * 4 + p] = _mm256_set_m128i(yhi, ylo);
+                }
+            }
+
+            __m256i acc[8];
+            for (int j = 0; j < ncols_interleaved; j++) {
+                acc[j] = _mm256_setzero_si256();
+            }
+            for (int r = 0; r < 8; r++) {
+                for (int j = 0; j < ncols_interleaved; j++) {
+                    acc[j] = mul_sum_us8_pairs_acc_int32x8(acc[j], qcode[j][r], yv[r]);
+                }
+            }
+
+            for (int j = 0; j < ncols_interleaved; j++) {
+                const int32_t sum_qy = hsum_i32_8_q2_0c(acc[j]);
                 sumf[j] += (float) (sum_qy - ysum) * dcol_f[j] * y->d;
             }
         }
