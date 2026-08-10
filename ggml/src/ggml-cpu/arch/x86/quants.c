@@ -1571,6 +1571,112 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+void ggml_vec_dot_stq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_stq1_0 * GGML_RESTRICT x = vx;
+    const block_q8_K   * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_K;
+
+#if defined(__AVX2__)
+    // STQ1_0: 64 groups of 4 weights per 256-weight superblock. Group g: 4-bit slot (qs nibble g) +
+    // 1-bit sign (sign bit g) index a 32-entry codebook -> a qpack byte of four 2-bit lanes q; the
+    // weight is q-1 (ternary). Stride-16 grouping: group g (chunk=g/16, gloc=g%16), lane p maps to
+    // activation y[chunk*64 + gloc + p*16]. Over a whole superblock the map is a permutation of all
+    // 256 activations, so dot(weight,y) = sum(q*y) - sum(y) (the -1 offset is one ysum subtraction).
+    //
+    // Two halves per block; each half = 16 qs bytes (32 groups), 4 sign bytes, 128 y bytes (2 chunks).
+    // Decoded regs' low 128-lane = groups 0-15 (chunk 2h), high = groups 16-31 (chunk 2h+1), so each
+    // lane-p plane is a contiguous 16-byte y slice (offset p*16 within each 64-byte chunk) - a plain
+    // load, no deinterleave. The 32-entry codebook is done as two 16-entry shuffle_epi8 (lo/hi halves)
+    // selected by the per-group sign via blendv - AVX2 has no native 32-entry cross-lane table lookup.
+    const __m256i cb_lo  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) stq1_0_codebook));
+    const __m256i cb_hi  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (stq1_0_codebook + 16)));
+    const __m128i m4b    = _mm_set1_epi8(0x0F);
+    const __m256i mask3  = _mm256_set1_epi8(0x03);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    // sign byte -> per-group byte: low 128-lane bytes 0-7 <- sign[0], 8-15 <- sign[1]; high 128-lane
+    // bytes 0-7 <- sign[2], 8-15 <- sign[3] (the 4 sign bytes are broadcast into each lane's low dword).
+    const __m256i sign_spread = _mm256_setr_epi8(0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+                                                 2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_sel = _mm256_setr_epi8(1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128,
+                                             1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128);
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const block_stq1_0 * xb = x + i;
+        const block_q8_K   * yb = y + i;
+
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+        __m256i acc = _mm256_setzero_si256();       // int32 lanes, accumulates sum(q*y)
+#else
+        __m256i acc16 = _mm256_setzero_si256();      // int16 lanes (<= 6096, no overflow), widened at end
+#endif
+
+        for (int h = 0; h < 2; ++h) {
+            const __m128i packed = _mm_loadu_si128((const __m128i *) (xb->qs + h * 16));
+            const __m128i lo = _mm_and_si128(packed, m4b);
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4b);
+            // slots: low 128 = groups 0-15 (byte j -> group 2j low nibble, 2j+1 high nibble), high = 16-31
+            const __m256i slots = MM256_SET_M128I(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+
+            uint32_t s4;
+            memcpy(&s4, xb->sign + h * 4, 4);
+            const __m256i sdup    = _mm256_shuffle_epi8(_mm256_set1_epi32((int) s4), sign_spread);
+            const __m256i sign_ff = _mm256_cmpeq_epi8(_mm256_and_si256(sdup, bit_sel), bit_sel);
+
+            const __m256i qp0   = _mm256_shuffle_epi8(cb_lo, slots);   // sign=0 codebook entries
+            const __m256i qp1   = _mm256_shuffle_epi8(cb_hi, slots);   // sign=1 codebook entries
+            const __m256i qpack = _mm256_blendv_epi8(qp0, qp1, sign_ff);
+
+            const int8_t * yqs = yb->qs + h * 128;
+            for (int p = 0; p < 4; ++p) {
+                const __m256i q    = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
+                const __m128i y_lo = _mm_loadu_si128((const __m128i *) (yqs + p * 16));
+                const __m128i y_hi = _mm_loadu_si128((const __m128i *) (yqs + 64 + p * 16));
+                const __m256i yv   = MM256_SET_M128I(y_hi, y_lo);
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+                acc = _mm256_dpbusd_epi32(acc, q, yv);
+#elif defined(__AVXVNNI__)
+                acc = _mm256_dpbusd_avx_epi32(acc, q, yv);
+#else
+                acc16 = _mm256_add_epi16(acc16, _mm256_maddubs_epi16(q, yv));
+#endif
+            }
+        }
+
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+        const int32_t sum_qy = hsum_i32_8(acc);
+#else
+        const int32_t sum_qy = hsum_i32_8(_mm256_madd_epi16(acc16, ones16));
+#endif
+        const __m256i bsums_raw = _mm256_loadu_si256((const __m256i *) yb->bsums);
+        const int32_t ysum = hsum_i32_8(_mm256_madd_epi16(bsums_raw, ones16));
+
+        // weight = q - 1  =>  dot(weight,y) = sum(q*y) - sum(y)
+#if defined(__F16C__)
+        const float d = _cvtsh_ss(xb->d) * yb->d;   // hardware fp16 (no ggml_table_f32_f16 dependency)
+#else
+        const float d = GGML_CPU_FP16_TO_FP32(xb->d) * yb->d;
+#endif
+        sumf += d * (float) (sum_qy - ysum);
+    }
+
+    *s = sumf;
+#else
+    UNUSED(x);
+    UNUSED(y);
+    UNUSED(nb);
+    ggml_vec_dot_stq1_0_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q2_0c_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
