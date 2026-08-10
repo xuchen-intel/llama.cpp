@@ -6742,3 +6742,213 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_gemm_q2_0c_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
 #endif
 }
+
+#if defined(__AVX2__)
+// Decode one STQ column-half (16 packed slot-bytes = 32 groups + 4 sign bytes) into a qpack vector:
+// low 128-lane = groups 0-15 (codebook bytes), high = groups 16-31. Two 16-entry shuffle_epi8 on the
+// codebook lo/hi halves, selected per-group by sign via blendv (AVX2 has no 32-entry table lookup).
+static inline __m256i stq1_0_decode_qpack(const __m128i packed, uint32_t s4,
+        const __m256i cb_lo, const __m256i cb_hi, const __m128i m4b,
+        const __m256i sign_spread, const __m256i bit_sel) {
+    const __m128i lo = _mm_and_si128(packed, m4b);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4b);
+    const __m256i slots = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
+    const __m256i sdup = _mm256_shuffle_epi8(_mm256_set1_epi32((int) s4), sign_spread);
+    const __m256i sign_ff = _mm256_cmpeq_epi8(_mm256_and_si256(sdup, bit_sel), bit_sel);
+    return _mm256_blendv_epi8(_mm256_shuffle_epi8(cb_lo, slots), _mm256_shuffle_epi8(cb_hi, slots), sign_ff);
+}
+#endif
+
+// STQ1_0 GEMV: same decode/math as ggml_vec_dot_stq1_0_q8_K, applied to the 8 interleaved columns of
+// block_stq1_0x8. Column j's half-h slot bytes are gathered from chunks 2h,2h+1 (qs[(2h)*64+j*8 : +8]
+// and qs[(2h+1)*64+j*8 : +8]); its sign bytes are contiguous at sign[j*8 : +8]. dot = sum(q*y) - ysum.
+void ggml_gemv_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int nb = n / QK_K;
+    const int ncols_interleaved = 8;
+
+    assert (n % QK_K == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+#if defined(__AVX2__)
+    const block_q8_K * a_ptr_start = (const block_q8_K *) vy;
+    const __m256i cb_lo  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) stq1_0_codebook));
+    const __m256i cb_hi  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (stq1_0_codebook + 16)));
+    const __m128i m4b    = _mm_set1_epi8(0x0F);
+    const __m256i mask3  = _mm256_set1_epi8(0x03);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    const __m256i sign_spread = _mm256_setr_epi8(0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+                                                 2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_sel = _mm256_setr_epi8(1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128,
+                                             1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128);
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_stq1_0x8 * b_ptr = (const block_stq1_0x8 *) vx + (x * nb);
+
+        float sumf[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+        for (int l = 0; l < nb; l++) {
+            const block_q8_K * y = a_ptr_start + l;
+
+            const __m256i bsums_raw = _mm256_loadu_si256((const __m256i *) y->bsums);
+            const int32_t ysum = hsum_i32_8_q2_0c(_mm256_madd_epi16(bsums_raw, ones16));
+
+            float dcol_f[8];
+            _mm256_storeu_ps(dcol_f, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b_ptr[l].d)));
+
+            for (int j = 0; j < ncols_interleaved; j++) {
+                const uint8_t * qs  = b_ptr[l].qs;
+                const uint8_t * sgn = b_ptr[l].sign + j * 8;
+
+                __m256i acc = _mm256_setzero_si256();
+                for (int h = 0; h < 2; h++) {
+                    const __m128i c0 = _mm_loadl_epi64((const __m128i *) (qs + (2*h    ) * 64 + j * 8));
+                    const __m128i c1 = _mm_loadl_epi64((const __m128i *) (qs + (2*h + 1) * 64 + j * 8));
+                    const __m128i packed = _mm_unpacklo_epi64(c0, c1);
+                    uint32_t s4;
+                    memcpy(&s4, sgn + h * 4, 4);
+                    const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, cb_hi, m4b, sign_spread, bit_sel);
+
+                    const int8_t * yqs = y->qs + h * 128;
+                    for (int p = 0; p < 4; p++) {
+                        const __m256i q = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
+                        const __m128i ylo = _mm_loadu_si128((const __m128i *) (yqs + p * 16));
+                        const __m128i yhi = _mm_loadu_si128((const __m128i *) (yqs + 64 + p * 16));
+                        acc = mul_sum_us8_pairs_acc_int32x8(acc, q, _mm256_set_m128i(yhi, ylo));
+                    }
+                }
+                const int32_t sum_qy = hsum_i32_8_q2_0c(acc);
+                sumf[j] += (float) (sum_qy - ysum) * dcol_f[j] * y->d;
+            }
+        }
+
+        for (int j = 0; j < ncols_interleaved; j++) {
+            s[x * ncols_interleaved + j] = sumf[j];
+        }
+    }
+#else
+    ggml_gemv_stq1_0_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+#endif
+}
+
+// STQ1_0 GEMM: decode each column's 8 "rounds" (round r = h*4 + p: half h in {0,1}, lane p in 0..3)
+// ONCE per (block, column) into qcode[col][r], then reuse across all 4 activation rows of the
+// block_q8_Kx4 batch and across all row-groups in the call (the Q2_0C GEMM amortization). The
+// activation for round r is a contiguous 16-weight span at pos = (2h + hi?)*64 + p*16, gathered from
+// the q8_Kx4 interleave exactly as Q2_0C's GEMM does (two 8-byte loads + unpacklo per 128-lane).
+void ggml_gemm_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int nb = n / QK_K;
+    const int ncols_interleaved = 8;
+
+    assert (n % QK_K == 0);
+    assert (nr % 4 == 0);
+    assert (nc % ncols_interleaved == 0);
+
+    UNUSED(bs);
+
+#if defined(__AVX2__)
+    const int n_groups = nr / 4;
+    const __m256i cb_lo  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) stq1_0_codebook));
+    const __m256i cb_hi  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (stq1_0_codebook + 16)));
+    const __m128i m4b    = _mm_set1_epi8(0x0F);
+    const __m256i mask3  = _mm256_set1_epi8(0x03);
+    const __m256i sign_spread = _mm256_setr_epi8(0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
+                                                 2,2,2,2,2,2,2,2, 3,3,3,3,3,3,3,3);
+    const __m256i bit_sel = _mm256_setr_epi8(1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128,
+                                             1,2,4,8,16,32,64,-128, 1,2,4,8,16,32,64,-128);
+
+    std::vector<float> sumf(nr * ncols_interleaved);
+    std::vector<int32_t> ysum_all(nr);
+
+    for (int x = 0; x < nc / ncols_interleaved; x++) {
+        const block_stq1_0x8 * b_ptr = (const block_stq1_0x8 *) vx + (x * nb);
+
+        std::fill(sumf.begin(), sumf.end(), 0.0f);
+
+        for (int l = 0; l < nb; l++) {
+            float dcol_f[8];
+            _mm256_storeu_ps(dcol_f, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) b_ptr[l].d)));
+
+            // ysum per (row-group, sub-row) from the q8_Kx4 bsums interleave
+            for (int g = 0; g < n_groups; g++) {
+                const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb + l;
+                for (int m = 0; m < 4; m++) {
+                    int32_t s_ = 0;
+                    for (int t = 0; t < 16; t++) {
+                        s_ += ya->bsums[(t / 4) * 16 + m * 4 + (t % 4)];
+                    }
+                    ysum_all[g * 4 + m] = s_;
+                }
+            }
+
+            // Decode all 8 columns' 8 rounds ONCE per block: qcode[col][round=h*4+p].
+            __m256i qcode[8][8];
+            for (int j = 0; j < ncols_interleaved; j++) {
+                const uint8_t * qs  = b_ptr[l].qs;
+                const uint8_t * sgn = b_ptr[l].sign + j * 8;
+                for (int h = 0; h < 2; h++) {
+                    const __m128i c0 = _mm_loadl_epi64((const __m128i *) (qs + (2*h    ) * 64 + j * 8));
+                    const __m128i c1 = _mm_loadl_epi64((const __m128i *) (qs + (2*h + 1) * 64 + j * 8));
+                    const __m128i packed = _mm_unpacklo_epi64(c0, c1);
+                    uint32_t s4;
+                    memcpy(&s4, sgn + h * 4, 4);
+                    const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, cb_hi, m4b, sign_spread, bit_sel);
+                    for (int p = 0; p < 4; p++) {
+                        qcode[j][h * 4 + p] = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
+                    }
+                }
+            }
+
+            for (int g = 0; g < n_groups; g++) {
+                const block_q8_Kx4 * ya = (const block_q8_Kx4 *) vy + g * nb + l;
+
+                __m256i acc[4][8];
+                for (int m = 0; m < 4; m++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        acc[m][j] = _mm256_setzero_si256();
+                    }
+                }
+
+                for (int r = 0; r < 8; r++) {
+                    const int h = r / 4;
+                    const int p = r % 4;
+                    const int pos_lo = (2*h    ) * 64 + p * 16; // groups 0-15 of half h
+                    const int pos_hi = (2*h + 1) * 64 + p * 16; // groups 16-31 of half h
+
+                    for (int m = 0; m < 4; m++) {
+                        const __m128i y_lo = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *) (ya->qs + (pos_lo / 8) * 32 + m * 8)),
+                            _mm_loadl_epi64((const __m128i *) (ya->qs + (pos_lo / 8 + 1) * 32 + m * 8)));
+                        const __m128i y_hi = _mm_unpacklo_epi64(
+                            _mm_loadl_epi64((const __m128i *) (ya->qs + (pos_hi / 8) * 32 + m * 8)),
+                            _mm_loadl_epi64((const __m128i *) (ya->qs + (pos_hi / 8 + 1) * 32 + m * 8)));
+                        const __m256i yv = _mm256_set_m128i(y_hi, y_lo);
+
+                        for (int j = 0; j < ncols_interleaved; j++) {
+                            acc[m][j] = mul_sum_us8_pairs_acc_int32x8(acc[m][j], qcode[j][r], yv);
+                        }
+                    }
+                }
+
+                for (int m = 0; m < 4; m++) {
+                    for (int j = 0; j < ncols_interleaved; j++) {
+                        const int32_t sum_qy = hsum_i32_8_q2_0c(acc[m][j]);
+                        sumf[(g * 4 + m) * ncols_interleaved + j] +=
+                            (float) (sum_qy - ysum_all[g * 4 + m]) * dcol_f[j] * ya->d[m];
+                    }
+                }
+            }
+        }
+
+        for (int row = 0; row < nr; row++) {
+            for (int j = 0; j < ncols_interleaved; j++) {
+                s[row * bs + x * ncols_interleaved + j] = sumf[row * ncols_interleaved + j];
+            }
+        }
+    }
+#else
+    ggml_gemm_stq1_0_8x8_q8_K_generic(n, s, bs, vx, vy, nr, nc);
+#endif
+}
