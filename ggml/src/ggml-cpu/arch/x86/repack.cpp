@@ -6745,17 +6745,26 @@ void ggml_gemm_q2_0c_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
 
 #if defined(__AVX2__)
 // Decode one STQ column-half (16 packed slot-bytes = 32 groups + 4 sign bytes) into a qpack vector:
-// low 128-lane = groups 0-15 (codebook bytes), high = groups 16-31. Two 16-entry shuffle_epi8 on the
-// codebook lo/hi halves, selected per-group by sign via blendv (AVX2 has no 32-entry table lookup).
+// low 128-lane = groups 0-15 (codebook bytes), high = groups 16-31.
+//
+// Only ONE 16-entry shuffle_epi8 codebook lookup is needed, not two: per 2-bit lane, q is always in
+// {0,1,2} (weight in {-1,0,+1}; q=3/weight+2 never occurs), and stq1_0_codebook's sign=1 half equals
+// 0xAA - (sign=0 half) as a plain byte subtraction -- verified for all 16 slots, and true in general
+// because subtracting 2 (0b10) from any 2-bit field value in {00,01,10} never borrows across the
+// field boundary. So the sign=1 qpack is a cheap ALU `sub_epi8` of the sign=0 qpack, not a second
+// lookup -- this trades a port-5-bound shuffle_epi8 for a subtract that can run on any ALU port,
+// cutting shuffle-port pressure from 3 calls (2 codebook + 1 sign-spread) to 2 per decode.
 static inline __m256i stq1_0_decode_qpack(const __m128i packed, uint32_t s4,
-        const __m256i cb_lo, const __m256i cb_hi, const __m128i m4b,
+        const __m256i cb_lo, const __m128i m4b,
         const __m256i sign_spread, const __m256i bit_sel) {
     const __m128i lo = _mm_and_si128(packed, m4b);
     const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), m4b);
     const __m256i slots = _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi));
     const __m256i sdup = _mm256_shuffle_epi8(_mm256_set1_epi32((int) s4), sign_spread);
     const __m256i sign_ff = _mm256_cmpeq_epi8(_mm256_and_si256(sdup, bit_sel), bit_sel);
-    return _mm256_blendv_epi8(_mm256_shuffle_epi8(cb_lo, slots), _mm256_shuffle_epi8(cb_hi, slots), sign_ff);
+    const __m256i qpack0 = _mm256_shuffle_epi8(cb_lo, slots);
+    const __m256i qpack1 = _mm256_sub_epi8(_mm256_set1_epi8((char) 0xAA), qpack0);
+    return _mm256_blendv_epi8(qpack0, qpack1, sign_ff);
 }
 #endif
 
@@ -6775,7 +6784,6 @@ void ggml_gemv_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #if defined(__AVX2__)
     const block_q8_K * a_ptr_start = (const block_q8_K *) vy;
     const __m256i cb_lo  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) stq1_0_codebook));
-    const __m256i cb_hi  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (stq1_0_codebook + 16)));
     const __m128i m4b    = _mm_set1_epi8(0x0F);
     const __m256i mask3  = _mm256_set1_epi8(0x03);
     const __m256i ones16 = _mm256_set1_epi16(1);
@@ -6809,7 +6817,7 @@ void ggml_gemv_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                     const __m128i packed = _mm_unpacklo_epi64(c0, c1);
                     uint32_t s4;
                     memcpy(&s4, sgn + h * 4, 4);
-                    const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, cb_hi, m4b, sign_spread, bit_sel);
+                    const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, m4b, sign_spread, bit_sel);
                     for (int p = 0; p < 4; p++) {
                         qcode[j][h * 4 + p] = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
                     }
@@ -6837,9 +6845,22 @@ void ggml_gemv_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                 }
             }
 
-            for (int j = 0; j < ncols_interleaved; j++) {
-                const int32_t sum_qy = hsum_i32_8_q2_0c(acc[j]);
-                sumf[j] += (float) (sum_qy - ysum) * dcol_f[j] * y->d;
+            // Reduce 2 columns' 8-lane accumulators to scalars per pair via 2x hadd + 1x add (3
+            // instructions for both), instead of calling the full 8-lane hsum_i32_8_q2_0c per column
+            // (~6 instructions EACH, 8 times = ~48 total). Unlike Q2_0C, a single column's dpbusd
+            // partial sums are spread across all 8 lanes of its own accumulator here (not confined to
+            // 2 adjacent lanes), so a full reduction is needed per column -- but it can still be
+            // batched 2-at-a-time: hadd(acc[2i],acc[2i+1]) interleaves both columns' partial sums,
+            // and a second hadd + one 128-bit add collapses each down to its true scalar total
+            // (verified: for a=acc[2i], b=acc[2i+1], the result's lane 0 = sum(a), lane 1 = sum(b)).
+            for (int j = 0; j < ncols_interleaved; j += 2) {
+                const __m256i h1 = _mm256_hadd_epi32(acc[j], acc[j + 1]);
+                const __m256i h2 = _mm256_hadd_epi32(h1, h1);
+                const __m128i combined = _mm_add_epi32(_mm256_castsi256_si128(h2), _mm256_extracti128_si256(h2, 1));
+                const int32_t sum_qy_0 = _mm_extract_epi32(combined, 0);
+                const int32_t sum_qy_1 = _mm_extract_epi32(combined, 1);
+                sumf[j]     += (float) (sum_qy_0 - ysum) * dcol_f[j]     * y->d;
+                sumf[j + 1] += (float) (sum_qy_1 - ysum) * dcol_f[j + 1] * y->d;
             }
         }
 
@@ -6870,7 +6891,6 @@ void ggml_gemm_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
 #if defined(__AVX2__)
     const int n_groups = nr / 4;
     const __m256i cb_lo  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) stq1_0_codebook));
-    const __m256i cb_hi  = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) (stq1_0_codebook + 16)));
     const __m128i m4b    = _mm_set1_epi8(0x0F);
     const __m256i mask3  = _mm256_set1_epi8(0x03);
     const __m256i sign_spread = _mm256_setr_epi8(0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1,
@@ -6913,7 +6933,7 @@ void ggml_gemm_stq1_0_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
                     const __m128i packed = _mm_unpacklo_epi64(c0, c1);
                     uint32_t s4;
                     memcpy(&s4, sgn + h * 4, 4);
-                    const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, cb_hi, m4b, sign_spread, bit_sel);
+                    const __m256i qpack = stq1_0_decode_qpack(packed, s4, cb_lo, m4b, sign_spread, bit_sel);
                     for (int p = 0; p < 4; p++) {
                         qcode[j][h * 4 + p] = _mm256_and_si256(_mm256_srli_epi16(qpack, 2 * p), mask3);
                     }
